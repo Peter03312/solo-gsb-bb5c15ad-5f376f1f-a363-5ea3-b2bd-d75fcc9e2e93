@@ -454,6 +454,18 @@ Schema），或直接调用 `POST /api/relation/mine` 与 `POST /api/relation/en
 - 蕴含 A → B 注入该作用域 Schema 节点的 `dependentRequired: { A: ["B"] }`（同一前件的多条
   规则合并为一个数组）；互斥 A / B 注入 `allOf: [{ not: { required: ["A", "B"] } }]`
   （多条互斥各自成为 `allOf` 的一项，可并存）。
+- **特殊键名 `__proto__`（无论作为前件还是后件）一律按对象自身字段（own property）的存在性
+  判断，不读原型链**。普通的 `dependentRequired` / `required` 会把 `__proto__` 特殊对待：Ajv
+  跳过字面的 `dependentRequired.__proto__` 条目，而 `required: ["__proto__"]` 在未开启
+  `ownProperties` 时读到的是继承来的原型槽位，导致仅含 `__proto__`（缺后件）或仅含另一键
+  （缺 `__proto__`）的违规新样本误判通过、或只含另一键的合规样本被误拒。因此凡涉及
+  `__proto__` 的蕴含 / 互斥，增强 Schema 改用基于 `propertyNames` 的自身键存在性断言
+  （蕴含：`{ if: <自身含 A>, then: <自身含 B> }`；互斥：
+  `{ not: { allOf: [<自身含 A>, <自身含 B>] } }`，其中 `<自身含 K>` 为
+  `{ "not": { "propertyNames": { "not": { "const": "K" } } } }`）。`propertyNames` 枚举的是
+  实例自身的可枚举属性名，绝不经过 `Object.prototype`，故校验器即使不开启 Ajv 的
+  `ownProperties` 选项、且字段值为 `null` / `undefined` 时判定也保持一致；根对象、嵌套对象
+  与数组元素作用域均在对应 Schema 节点上施加同一约束。普通字段的落地形式与 API 形态不变。
 - 后端在生成后用 Ajv 对**全部原样本**复验：**任一样本不通过则不产出**（HTTP 422），响应
   携带失败样本索引（`failures[].index`）与完整 Ajv 错误；所选规则因样本变化失效（重挖后
   找不到该规则 id）同样 422 拒绝并逐条列出。
@@ -475,7 +487,7 @@ npm run dev:client   # 前端 http://localhost:5173（/api 代理到 8080）
 ## 测试
 
 ```bash
-npm test             # node:test，覆盖归纳引擎、契约比较器、反例生成器、样本影响扫描、样本贡献度、事件变体契约、匿名化导出、契约切片、历史样本迁移（含输入绑定/过期响应判定）、字段关系挖掘（含规则标识无碰撞）、错误热点聚簇、HTTP API 与发布门禁（265 项）
+npm test             # node:test，覆盖归纳引擎、契约比较器、反例生成器、样本影响扫描、样本贡献度、事件变体契约、匿名化导出、契约切片、历史样本迁移（含输入绑定/过期响应判定）、字段关系挖掘（含规则标识无碰撞、__proto__ 自身键存在性）、错误热点聚簇、HTTP API 与发布门禁（271 项）
 ```
 
 ## API
@@ -712,6 +724,50 @@ curl -s -X POST http://localhost:8080/api/relation/enhance \
 # —— 任一样本复验失败（或规则 id 已失效）时返回 422 且不产出 schema
 ```
 
+字段名恰好为 `__proto__` 时（键名按 JSON 文本提交，由服务端 body parser 解析为对象自身键；
+切勿用 JS 对象字面量构造），勾选蕴含后违规新样本在两个方向上都会被拒绝，且全部原样本仍复验
+通过（根对象 / 嵌套对象 / 数组元素作用域同理）：
+
+```bash
+# 两条样本同时含 "__proto__" 与 b，第三条两者都不含
+SAMPLES='[ {"__proto__":1,"b":2}, {"__proto__":3,"b":4}, {"c":5} ]'
+
+# 1) 挖掘：两个方向的蕴含候选都会出现（id 中 __proto__ 按原始键名长度定界）
+curl -s -X POST http://localhost:8080/api/relation/mine \
+  -H 'Content-Type: application/json' \
+  -d "{\"samples\":$SAMPLES}"
+# -> implications: [{ "id": "implication|0:|9:__proto__->1:b", "a": "__proto__", "b": "b", ... },
+#                   { "id": "implication|0:|1:b->9:__proto__", "a": "b", "b": "__proto__", ... }]
+
+# 2) 选 "__proto__" -> b 生成增强 Schema（不写 dependentRequired.__proto__，
+#    改为 propertyNames 自身键存在性断言；普通字段仍是 dependentRequired / not+required）
+curl -s -X POST http://localhost:8080/api/relation/enhance \
+  -H 'Content-Type: application/json' \
+  -d "{\"schema\":{\"type\":\"object\",
+        \"properties\":{\"__proto__\":{\"type\":\"integer\"},\"b\":{\"type\":\"integer\"},\"c\":{\"type\":\"integer\"}},
+        \"patternProperties\":{\"^__proto__$\":{\"type\":\"integer\"}}},
+       \"samples\":$SAMPLES,
+       \"ruleIds\":[\"implication|0:|9:__proto__->1:b\"]}"
+# -> { "ruleCount": 1, "sampleCount": 3,
+#      "schema": { ...,
+#        "allOf": [ { "if":   { "not": { "propertyNames": { "not": { "const": "__proto__" } } } },
+#                    "then": { "not": { "propertyNames": { "not": { "const": "b" } } } } } ] } }
+
+# 3) 仅含 "__proto__" 的新样本必须被拒绝（两个方向对称）
+curl -s -X POST http://localhost:8080/api/validate \
+  -H 'Content-Type: application/json' \
+  -d '{"schema": <上一步返回的 schema>, "sample": {"__proto__": 9}}'
+# -> { "valid": false, "errors": [ { "keyword": "if", ... } ] }
+```
+
+也可直接运行可调用示例（先 `npm start` 启动服务），它会依次演示挖掘、两个方向的增强、违规新
+样本拒绝与全部原样本复验：
+
+```bash
+node server/examples/proto-relation.js          # 默认 127.0.0.1:8080
+PORT=8091 node server/examples/proto-relation.js
+```
+
 ## 目录结构
 
 ```
@@ -728,7 +784,9 @@ curl -s -X POST http://localhost:8080/api/relation/enhance \
 │   ├── anonymize.js        # 匿名化导出（JSON Pointer + 单段 * 通配递归匹配，跨样本稳定、类型保留的假名替换，单次上限 200 条）
 │   ├── slice.js            # 契约切片（按勾选的 Schema 树 Pointer 裁剪结构 + 投影样本 + Ajv 逐条校验，样本上限 200 条、Pointer 上限 20 个）
 │   ├── migrate.js          # 历史样本迁移（按路径深度规划源移除/目标写入 + 逐样本原子移动/补值；数组下标按迁移前位置定位、空位统一压缩，父子重叠、目标冲突处理 + Ajv 按当前 Schema 校验，上限 200 条）
-│   ├── relation.js         # 字段关系挖掘（按对象 Pointer 作用域统计字段出现，数组元素独立计数，支持≥2/置信100% 蕴含与互斥 + 蕴含传递约简；增强 Schema 注入 dependentRequired / not+required 并用全部原样本 Ajv 复验）
+│   ├── relation.js         # 字段关系挖掘（按对象 Pointer 作用域统计字段出现，数组元素独立计数，支持≥2/置信100% 蕴含与互斥 + 蕴含传递约简；增强 Schema 注入 dependentRequired / not+required，涉及 __proto__ 的规则改用 propertyNames 自身键存在性断言，并用全部原样本 Ajv 复验）
+│   ├── examples/
+│   │   └── proto-relation.js # 可运行示例：__proto__ 字段参与蕴含时，两个方向的增强/校验 HTTP 全流程
 │   ├── hotspot.js          # 错误热点聚簇（Ajv 逐条校验 ≤200 条样本，按 schemaPath+keyword 聚簇，required/additionalProperties 按字段分簇，按受影响样本数降序）
 │   ├── app.js              # Express（/api/infer、/api/validate、/api/hotspots、/api/diff、/api/counterexample、/api/scan、/api/contribution、/api/variant、/api/anonymize、/api/slice、/api/migrate、/api/relation/mine、/api/relation/enhance、静态托管）
 │   ├── index.js            # 入口：监听 PORT（默认 8080）

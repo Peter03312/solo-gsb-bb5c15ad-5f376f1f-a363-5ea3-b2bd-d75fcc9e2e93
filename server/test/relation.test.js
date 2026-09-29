@@ -316,6 +316,149 @@ test("enhanceSchema rejects documents that violate the mined rules", () => {
   assert.equal(validate({ a: 1, b: 2, c: 3 }), false); // not/required
 });
 
+test("mineRelations treats __proto__ as an ordinary own field", () => {
+  // JSON.parse (the HTTP body parser) stores "__proto__" as an own key.
+  const samples = [
+    JSON.parse(`{"__proto__":1,"b":2}`),
+    JSON.parse(`{"__proto__":3,"b":4}`),
+    { c: 5 },
+  ];
+  const root = mineRelations({ samples }).scopes[0];
+  const edges = root.implications.map((r) => `${r.a}->${r.b}`).sort();
+  assert.deepEqual(edges, ["__proto__->b", "b->__proto__"]);
+  const fwd = root.implications.find((r) => r.a === "__proto__");
+  assert.equal(fwd.support, 2);
+  assert.deepEqual(fwd.sampleIndexes, [0, 1]);
+});
+
+test("enhanceSchema enforces __proto__ implications by own-key presence (both directions)", () => {
+  // Samples twice contain both "__proto__" and "b"; a third contains neither.
+  // Selecting "__proto__ -> b" must reject a document carrying only
+  // "__proto__", and selecting "b -> __proto__" must reject one carrying only
+  // "b" — presence is judged on the instance's own key, never the inherited
+  // prototype slot. The check must hold even when the consuming validator does
+  // not enable Ajv's ownProperties option.
+  const Ajv2020 = require("ajv/dist/2020").default;
+  const samples = [
+    JSON.parse(`{"__proto__":1,"b":2}`),
+    JSON.parse(`{"__proto__":3,"b":4}`),
+    { c: 5 },
+  ];
+  const { schema } = inferSchema(samples);
+  const mined = mineRelations({ samples, schema });
+  const fwd = mined.scopes[0].implications.find((r) => r.a === "__proto__" && r.b === "b");
+  const rev = mined.scopes[0].implications.find((r) => r.a === "b" && r.b === "__proto__");
+
+  for (const ajvOpts of [{ strict: false }, { strict: false, ownProperties: true }]) {
+    for (const [rule, violating] of [
+      [fwd, JSON.parse(`{"__proto__":9}`)],
+      [rev, JSON.parse(`{"b":9}`)],
+    ]) {
+      const out = enhanceSchema({ schema, samples, ruleIds: [rule.id] });
+      const validate = new Ajv2020(ajvOpts).compile(out.schema);
+      assert.equal(validate(violating), false); // new violating sample rejected
+      assert.equal(validate(JSON.parse(`{"__proto__":9,"b":8}`)), true);
+      assert.equal(validate({}), true); // neither key present: rule vacuous
+      // every original sample still passes
+      for (const sample of samples) assert.equal(validate(sample), true);
+    }
+  }
+});
+
+test("enhanceSchema does not emit dependentRequired for __proto__ rules", () => {
+  // Ajv skips a literal dependentRequired["__proto__"] entry; the portable
+  // own-key encoding lives in allOf instead, while ordinary fields are
+  // untouched.
+  const samples = [
+    JSON.parse(`{"__proto__":1,"b":2}`),
+    JSON.parse(`{"__proto__":3,"b":4}`),
+    { c: 5 },
+  ];
+  const { schema } = inferSchema(samples);
+  const mined = mineRelations({ samples, schema });
+  const fwd = mined.scopes[0].implications.find((r) => r.a === "__proto__");
+  const out = enhanceSchema({ schema, samples, ruleIds: [fwd.id] });
+  assert.equal(out.schema.dependentRequired, undefined);
+  assert.ok(Array.isArray(out.schema.allOf));
+  assert.equal(out.schema.allOf.length, 1);
+  assert.ok(out.schema.allOf[0].if);
+  assert.ok(out.schema.allOf[0].then);
+});
+
+test("enhanceSchema counts an own __proto__:null as present, regardless of value", () => {
+  // Relation mining observes key presence; a null own "__proto__" still counts.
+  const Ajv2020 = require("ajv/dist/2020").default;
+  const samples = [
+    JSON.parse(`{"__proto__":null,"b":2}`),
+    JSON.parse(`{"__proto__":3,"b":4}`),
+    { c: 5 },
+  ];
+  const { schema } = inferSchema(samples);
+  const mined = mineRelations({ samples, schema });
+  const fwd = mined.scopes[0].implications.find((r) => r.a === "__proto__");
+  const rev = mined.scopes[0].implications.find((r) => r.b === "__proto__");
+  const vFwd = new Ajv2020({ strict: false }).compile(
+    enhanceSchema({ schema, samples, ruleIds: [fwd.id] }).schema
+  );
+  const vRev = new Ajv2020({ strict: false }).compile(
+    enhanceSchema({ schema, samples, ruleIds: [rev.id] }).schema
+  );
+  assert.equal(vFwd(JSON.parse(`{"__proto__":null}`)), false); // antecedent present, b missing
+  assert.equal(vRev(JSON.parse(`{"b":8,"__proto__":null}`)), true); // consequent present
+});
+
+test("enhanceSchema enforces __proto__ rules inside nested and array-item scopes", () => {
+  const Ajv2020 = require("ajv/dist/2020").default;
+  const ajv = new Ajv2020({ strict: false });
+
+  const nested = [
+    JSON.parse(`{"o":{"__proto__":1,"b":2}}`),
+    JSON.parse(`{"o":{"__proto__":3,"b":4}}`),
+    JSON.parse(`{"o":{"c":5}}`),
+  ];
+  let schema = inferSchema(nested).schema;
+  let ids = mineRelations({ samples: nested, schema }).scopes.flatMap((g) =>
+    g.implications.map((r) => r.id)
+  );
+  let validate = ajv.compile(enhanceSchema({ schema, samples: nested, ruleIds: ids }).schema);
+  assert.equal(validate(JSON.parse(`{"o":{"__proto__":9}}`)), false);
+  assert.equal(validate(JSON.parse(`{"o":{"b":9}}`)), false);
+  assert.equal(validate(JSON.parse(`{"o":{"__proto__":9,"b":8}}`)), true);
+
+  const items = [
+    JSON.parse(`{"list":[{"__proto__":1,"b":2},{"__proto__":3,"b":4},{"c":5}]}`),
+  ];
+  schema = inferSchema(items).schema;
+  ids = mineRelations({ samples: items, schema }).scopes.flatMap((g) =>
+    g.implications.map((r) => r.id)
+  );
+  validate = ajv.compile(enhanceSchema({ schema, samples: items, ruleIds: ids }).schema);
+  assert.equal(validate(JSON.parse(`{"list":[{"__proto__":9}]}`)), false);
+  assert.equal(validate(JSON.parse(`{"list":[{"b":9}]}`)), false);
+  assert.equal(validate(JSON.parse(`{"list":[{"__proto__":9,"b":8}]}`)), true);
+});
+
+test("enhanceSchema encodes __proto__ exclusions by own-key presence", () => {
+  // not/required would see the inherited prototype as a present "__proto__" and
+  // wrongly reject a document that only contains "b".
+  const Ajv2020 = require("ajv/dist/2020").default;
+  const samples = [
+    JSON.parse(`{"__proto__":1}`),
+    JSON.parse(`{"__proto__":2}`),
+    { b: 3 },
+    { b: 4 },
+  ];
+  const { schema } = inferSchema(samples);
+  const id = mineRelations({ samples, schema }).scopes[0].exclusions[0].id;
+  const validate = new Ajv2020({ strict: false }).compile(
+    enhanceSchema({ schema, samples, ruleIds: [id] }).schema
+  );
+  assert.equal(validate(JSON.parse(`{"__proto__":1,"b":2}`)), false);
+  assert.equal(validate(JSON.parse(`{"__proto__":1}`)), true);
+  assert.equal(validate({ b: 2 }), true); // must not false-positive on the prototype
+  assert.equal(validate({}), true);
+});
+
 test("enhanceSchema refuses (422, no schema) when an original sample fails Ajv", () => {
   // The implication holds on the samples, but the supplied schema rejects
   // them via an unrelated constraint, simulating schema/sample drift.

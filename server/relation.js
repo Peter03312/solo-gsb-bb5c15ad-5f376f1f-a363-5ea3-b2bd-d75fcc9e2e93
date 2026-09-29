@@ -33,6 +33,17 @@
  *   - implication A -> B : dependentRequired: { A: [B, ...] }
  *   - exclusion A / B   : allOf: [ { not: { required: [A, B] } }, ... ]
  *
+ * "__proto__" rules cannot use the plain keywords: Ajv skips a literal
+ * `dependentRequired.__proto__` entry when iterating the schema, and without
+ * its `ownProperties` option `required: ["__proto__"]` tests the *inherited*
+ * prototype slot instead of the instance's own key, so a violating new sample
+ * could pass (in either the antecedent or the consequent position). Rules
+ * touching "__proto__" therefore use an own-key-only presence assertion built
+ * from `propertyNames`, which iterates the instance's own property names and
+ * never reads through Object.prototype — regardless of the validator's
+ * `ownProperties` setting — while ordinary fields keep dependentRequired /
+ * not-required exactly as before.
+ *
  * Every ORIGINAL sample is then re-validated against the enhanced schema with
  * Ajv; a single failure refuses the run (422) together with the failing sample
  * indexes — no enhanced schema is produced.
@@ -57,7 +68,7 @@
  */
 
 const Ajv2020 = require("ajv/dist/2020").default;
-const { escapePointer, setOwnKey } = require("./infer");
+const { escapePointer, setOwnKey, PROTO_KEY } = require("./infer");
 
 const MAX_SAMPLES = 200;
 const MIN_SUPPORT = 2;
@@ -69,6 +80,35 @@ const clone = (value) => JSON.parse(JSON.stringify(value));
 
 function isPlainSchema(node) {
   return node !== null && typeof node === "object" && !Array.isArray(node);
+}
+
+/**
+ * Schema fragment asserting that the validated object carries `key` as an OWN
+ * property.
+ *
+ * Plain `required: [key]` reads `data[key] !== undefined`, so for a key named
+ * "__proto__" it observes Object.prototype (always present) instead of the
+ * instance's own slot. `propertyNames` instead validates each of the object's
+ * own enumerable property names against its subschema: "no own name differs
+ * from `key`" can only hold when at least one own name equals `key` (an empty
+ * name list vacuously has no differing name, hence the outer `not` flips it to
+ * a failure). The check is therefore own-key based for ANY key, works whether
+ * or not Ajv runs with `ownProperties`, and also matches an own "__proto__"
+ * whose value is `undefined`/`null` (presence, not value, is what relation
+ * rules mine).
+ */
+function ownKeyPresence(key) {
+  return { not: { propertyNames: { not: { const: key } } } };
+}
+
+/** Implication "A present  =>  B present", own-key based on both sides. */
+function implicationSchema(a, b) {
+  return { if: ownKeyPresence(a), then: ownKeyPresence(b) };
+}
+
+/** Exclusion "A and B never co-occur", own-key based on both sides. */
+function exclusionSchema(a, b) {
+  return { not: { allOf: [ownKeyPresence(a), ownKeyPresence(b)] } };
 }
 
 /**
@@ -645,6 +685,15 @@ function enhanceSchema({ schema, samples, ruleIds }) {
 
     for (const rule of rules) {
       if (rule.kind === "implication") {
+        if (rule.a === PROTO_KEY || rule.b === PROTO_KEY) {
+          // dependentRequired cannot reliably express presence of a literal
+          // "__proto__" (Ajv skips the antecedent entry; the consequent reads
+          // the inherited prototype slot without ownProperties), so the rule
+          // is encoded with own-key-only propertyNames assertions.
+          if (!Array.isArray(node.allOf)) node.allOf = [];
+          node.allOf.push(implicationSchema(rule.a, rule.b));
+          continue;
+        }
         if (!isPlainSchema(node.dependentRequired)) node.dependentRequired = {};
         // hasOwnProperty: reading "__proto__" before it was written would
         // otherwise yield Object.prototype (truthy) and crash `new Set`.
@@ -656,13 +705,16 @@ function enhanceSchema({ schema, samples, ruleIds }) {
           : [];
         const deps = new Set(existing);
         deps.add(rule.b);
-        // A rule keyed "__proto__" must not hit the prototype setter; Ajv
-        // itself skips that dependentRequired name, so the rule simply stays
-        // descriptive for that edge.
         setOwnKey(node.dependentRequired, rule.a, [...deps].sort());
       } else {
         if (!Array.isArray(node.allOf)) node.allOf = [];
-        node.allOf.push({ not: { required: [rule.a, rule.b] } });
+        if (rule.a === PROTO_KEY || rule.b === PROTO_KEY) {
+          // not/required would treat the inherited prototype slot as a present
+          // "__proto__" and reject documents that merely contain the other key.
+          node.allOf.push(exclusionSchema(rule.a, rule.b));
+        } else {
+          node.allOf.push({ not: { required: [rule.a, rule.b] } });
+        }
       }
     }
   }
