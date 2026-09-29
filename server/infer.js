@@ -97,6 +97,34 @@ function syncProtoPattern(node) {
   }
 }
 
+/**
+ * Re-point every "__proto__" patternProperties companion at its own node to
+ * the matching properties entry, recursively over the whole schema tree
+ * (including `items` and every nested object/array keyword).
+ *
+ * syncProtoPattern keeps the two entries identical by reference at inference
+ * time, but a JSON round-trip (e.g. the enhancer cloning the schema) turns
+ * them into independent copies: rules later injected onto the `properties`
+ * node then never reach Ajv, which enforces a literal "__proto__" field
+ * exclusively through the patternProperties alias. Re-syncing after every
+ * mutation makes the alias point back at the enhanced node. The traversal is
+ * cycle-safe.
+ */
+function syncProtoAliasesDeep(node, seen = new Set()) {
+  if (node === null || typeof node !== "object" || seen.has(node)) return;
+  seen.add(node);
+  syncProtoPattern(node);
+  for (const value of Object.values(node)) {
+    if (value !== null && typeof value === "object") {
+      if (Array.isArray(value)) {
+        for (const item of value) syncProtoAliasesDeep(item, seen);
+      } else {
+        syncProtoAliasesDeep(value, seen);
+      }
+    }
+  }
+}
+
 function sortTypes(typeSet) {
   return [...typeSet].sort((a, b) => TYPE_ORDER.indexOf(a) - TYPE_ORDER.indexOf(b));
 }
@@ -197,6 +225,7 @@ module.exports = {
   typeOf,
   escapePointer,
   syncProtoPattern,
+  syncProtoAliasesDeep,
   setOwnKey,
   isProtoKey,
   PROTO_KEY,

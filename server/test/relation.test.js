@@ -316,6 +316,161 @@ test("enhanceSchema rejects documents that violate the mined rules", () => {
   assert.equal(validate({ a: 1, b: 2, c: 3 }), false); // not/required
 });
 
+// Ajv treats a literal "__proto__" specially (it never compiles the literal
+// properties entry; presence must come from hasOwnProperty). The enhanced
+// schema must still reject violating new samples whether the field is the
+// antecedent or the consequent of the picked rule.
+function protoAjv() {
+  const Ajv2020 = require("ajv/dist/2020").default;
+  return new Ajv2020({ allErrors: true, strict: false, ownProperties: true });
+}
+
+// Build samples with "__proto__" as a normal own JSON key (JSON.parse semantics).
+function protoSamples(texts) {
+  return texts.map((text) => JSON.parse(text));
+}
+
+function rulesFor(samples, filter) {
+  const { schema } = inferSchema(samples);
+  const mined = mineRelations({ samples, schema });
+  const ruleIds = mined.scopes.flatMap((g) =>
+    [...g.implications, ...g.exclusions].filter((r) => filter(r)).map((r) => r.id)
+  );
+  return { schema, ruleIds };
+}
+
+// Compile the schema after an HTTP-style JSON round-trip: a real client
+// receives serialized JSON, which turns the patternProperties alias into an
+// independent copy — the enhancer must re-sync it before responding.
+function compileEnhanced(out) {
+  const wire = JSON.parse(JSON.stringify(out.schema));
+  return protoAjv().compile(wire);
+}
+
+test("__proto__ antecedent at root: a __proto__-only new sample is rejected", () => {
+  const samples = protoSamples([
+    '{"__proto__": 1, "b": 2}',
+    '{"__proto__": 3, "b": 4}',
+    "{}",
+  ]);
+  const { schema, ruleIds } = rulesFor(
+    samples,
+    (r) => r.kind === "implication" && r.a === "__proto__" && r.b === "b"
+  );
+  const out = enhanceSchema({ schema, samples, ruleIds });
+  const validate = compileEnhanced(out);
+  samples.forEach((sample, i) => assert.equal(validate(sample), true, `original #${i}`));
+  assert.equal(validate(JSON.parse('{"__proto__": 9}')), false);
+  // The dependentRequired entry is an own enumerable property, not the
+  // prototype setter, so it survives the JSON round-trip. (A literal
+  // { __proto__: ... } in source sets the prototype, so assert via the
+  // descriptor rather than an object literal.)
+  const roundTripped = JSON.parse(JSON.stringify(out.schema.dependentRequired));
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(roundTripped, "__proto__"),
+    true
+  );
+  assert.deepEqual(roundTripped.__proto__, ["b"]);
+});
+
+test("__proto__ consequent at root: b without __proto__ is rejected", () => {
+  const samples = protoSamples([
+    '{"__proto__": 1, "b": 2}',
+    '{"__proto__": 3, "b": 4}',
+    "{}",
+  ]);
+  const { schema, ruleIds } = rulesFor(
+    samples,
+    (r) => r.kind === "implication" && r.a === "b" && r.b === "__proto__"
+  );
+  const out = enhanceSchema({ schema, samples, ruleIds });
+  const validate = compileEnhanced(out);
+  samples.forEach((sample, i) => assert.equal(validate(sample), true, `original #${i}`));
+  assert.equal(validate(JSON.parse('{"b": 9}')), false);
+  assert.equal(validate({}), true);
+});
+
+test("__proto__ exclusion at root: co-occurrence is rejected", () => {
+  const samples = protoSamples([
+    '{"__proto__": 1}',
+    '{"__proto__": 3}',
+    '{"b": 2}',
+    '{"b": 4}',
+  ]);
+  const { schema, ruleIds } = rulesFor(samples, (r) => r.kind === "exclusion");
+  const out = enhanceSchema({ schema, samples, ruleIds });
+  const validate = compileEnhanced(out);
+  samples.forEach((sample, i) => assert.equal(validate(sample), true, `original #${i}`));
+  assert.equal(validate(JSON.parse('{"__proto__": 1, "b": 2}')), false);
+  assert.equal(validate({}), true);
+});
+
+test("rules inside a __proto__ object value are enforced after the clone", () => {
+  const samples = protoSamples([
+    '{"__proto__": {"x": 1, "y": 2}}',
+    '{"__proto__": {"x": 3, "y": 4}}',
+    '{"__proto__": {}}',
+  ]);
+  const { schema, ruleIds } = rulesFor(
+    samples,
+    (r) => r.kind === "implication" && r.scopePointer === "/properties/__proto__"
+  );
+  assert.equal(ruleIds.length, 2); // x -> y and y -> x
+  const out = enhanceSchema({ schema, samples, ruleIds });
+  // The patternProperties companion Ajv actually compiles must be the very
+  // node carrying the injected dependentRequired.
+  assert.equal(
+    out.schema.patternProperties["^__proto__$"],
+    out.schema.properties.__proto__
+  );
+  const validate = compileEnhanced(out);
+  samples.forEach((sample, i) => assert.equal(validate(sample), true, `original #${i}`));
+  assert.equal(validate(JSON.parse('{"__proto__": {"x": 9}}')), false);
+  assert.equal(validate(JSON.parse('{"__proto__": {"y": 9}}')), false);
+  assert.equal(validate(JSON.parse('{"__proto__": {}}')), true);
+});
+
+test("rules inside a __proto__ value nested in plain objects and array items", () => {
+  const samples = protoSamples([
+    '{"o": {"__proto__": {"x": 1, "y": 2}}}',
+    '{"o": {"__proto__": {"x": 3, "y": 4}}}',
+    '{"o": {"__proto__": {}}}',
+    '{"list": [{"__proto__": {"x": 5, "y": 6}}, {"__proto__": {"x": 7, "y": 8}}]}',
+    '{"list": [{"__proto__": {}}, {"__proto__": {}}]}',
+  ]);
+  const { schema, ruleIds } = rulesFor(
+    samples,
+    (r) => r.kind === "implication" && r.a === "x" && r.b === "y"
+  );
+  assert.equal(ruleIds.length, 2); // nested object scope and array item scope
+  const out = enhanceSchema({ schema, samples, ruleIds });
+  const validate = compileEnhanced(out);
+  samples.forEach((sample, i) => assert.equal(validate(sample), true, `original #${i}`));
+  assert.equal(validate(JSON.parse('{"o": {"__proto__": {"x": 9}}}')), false);
+  assert.equal(validate(JSON.parse('{"list": [{"__proto__": {"x": 9}}]}')), false);
+  assert.equal(validate(JSON.parse('{"o": {"__proto__": {}}}')), true);
+  assert.equal(validate(JSON.parse('{"list": [{"__proto__": {}}]}')), true);
+});
+
+test("exclusion inside a __proto__ object value is enforced after the clone", () => {
+  const samples = protoSamples([
+    '{"__proto__": {"x": 1}}',
+    '{"__proto__": {"x": 2}}',
+    '{"__proto__": {"y": 1}}',
+    '{"__proto__": {"y": 2}}',
+  ]);
+  const { schema, ruleIds } = rulesFor(
+    samples,
+    (r) => r.kind === "exclusion" && r.scopePointer === "/properties/__proto__"
+  );
+  assert.equal(ruleIds.length, 1);
+  const out = enhanceSchema({ schema, samples, ruleIds });
+  const validate = compileEnhanced(out);
+  samples.forEach((sample, i) => assert.equal(validate(sample), true, `original #${i}`));
+  assert.equal(validate(JSON.parse('{"__proto__": {"x": 1, "y": 2}}')), false);
+  assert.equal(validate(JSON.parse('{"__proto__": {"x": 1}}')), true);
+});
+
 test("enhanceSchema refuses (422, no schema) when an original sample fails Ajv", () => {
   // The implication holds on the samples, but the supplied schema rejects
   // them via an unrelated constraint, simulating schema/sample drift.

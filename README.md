@@ -459,6 +459,14 @@ Schema），或直接调用 `POST /api/relation/mine` 与 `POST /api/relation/en
   找不到该规则 id）同样 422 拒绝并逐条列出。
 - 成功后可一键复制增强 Schema，或「在校验页验证 →」切到「③ 校验新样本」以该 Schema 为
   校验目标；任何样本或勾选变化都会使上次增强结果失效。
+- **原始字段名 `__proto__` 照常参与蕴含/互斥**：字段存在性一律按对象**自身字段**
+  （`hasOwnProperty`）判定，因此 `__proto__` 作前件或后件都生效——例如两条样本同时含
+  `__proto__`、`b`，另有一条二者皆无，选中 `__proto__ -> b` 后，仅含 `__proto__` 的新样本
+  必被拒绝；反向 `b -> __proto__` 对仅含 `b` 的样本亦然。根对象、嵌套对象与数组元素作用域
+  同样施加约束。由于 Ajv 不编译字面量 `properties.__proto__` 节点，归纳阶段用
+  `patternProperties: "^__proto__$"` 别名承载该字段的全部约束；增强器克隆 Schema 后会在
+  编译前把所有作用域的别名重新指向增强后的节点（含 `__proto__` 值对象内部的规则），保证
+  经 HTTP JSON 往返后产出的增强 Schema 仍能拦截违规新样本。
 - 单次最多 200 条样本；样本集非数组 / 为空、规则 id 非字符串返回 400，Schema 无法编译或
   复验失败返回 422。
 
@@ -475,7 +483,7 @@ npm run dev:client   # 前端 http://localhost:5173（/api 代理到 8080）
 ## 测试
 
 ```bash
-npm test             # node:test，覆盖归纳引擎、契约比较器、反例生成器、样本影响扫描、样本贡献度、事件变体契约、匿名化导出、契约切片、历史样本迁移（含输入绑定/过期响应判定）、字段关系挖掘（含规则标识无碰撞）、错误热点聚簇、HTTP API 与发布门禁（265 项）
+npm test             # node:test，覆盖归纳引擎、契约比较器、反例生成器、样本影响扫描、样本贡献度、事件变体契约、匿名化导出、契约切片、历史样本迁移（含输入绑定/过期响应判定）、字段关系挖掘（含规则标识无碰撞）、错误热点聚簇、HTTP API 与发布门禁（271 项）
 ```
 
 ## API
@@ -710,6 +718,56 @@ curl -s -X POST http://localhost:8080/api/relation/enhance \
 # -> { "ruleCount": 1, "sampleCount": 4,
 #      "schema": { ..., "allOf": [{ "not": { "required": ["at", "reason"] } }] } }
 # —— 任一样本复验失败（或规则 id 已失效）时返回 422 且不产出 schema
+```
+
+字段名恰为 `__proto__` 时同样可挖掘、可增强（前件 / 后件均按对象自身字段存在性判断）。
+JSON 中它就是普通键，直接用 HTTP 传 JSON 即可；下面用 Python 生成请求体，避免 shell
+字面量里的 `__proto__` 歧义：
+
+```bash
+python3 - <<'PY' | curl -s -X POST http://localhost:8080/api/relation/mine \
+  -H 'Content-Type: application/json' --data-binary @-
+import json
+print(json.dumps({"samples": [
+    {"__proto__": 1, "b": 2},
+    {"__proto__": 3, "b": 4},
+    {},
+]}))
+PY
+# -> 根作用域两条蕴含（各支持 2）：
+#    "implication|0:|9:__proto__->1:b"   (__proto__ -> b)
+#    "implication|0:|1:b->9:__proto__"   (b -> __proto__)
+
+# 选中 __proto__ -> b 生成增强 Schema（后端重新挖掘校验 id，并用 Ajv 复验全部原样本）
+python3 - <<'PY' | curl -s -X POST http://localhost:8080/api/relation/enhance \
+  -H 'Content-Type: application/json' --data-binary @-
+import json
+print(json.dumps({
+  "schema": {
+    "type": "object",
+    "properties": {
+      "__proto__": {"type": "integer"},
+      "b": {"type": "integer"},
+    },
+    "patternProperties": {"^__proto__$": {"type": "integer"}},
+  },
+  "samples": [
+    {"__proto__": 1, "b": 2},
+    {"__proto__": 3, "b": 4},
+    {},
+  ],
+  "ruleIds": ["implication|0:|9:__proto__->1:b"],
+}))
+PY
+# -> { "ruleCount": 1, "sampleCount": 3,
+#      "schema": { ..., "dependentRequired": { "__proto__": ["b"] },
+#                  "patternProperties": { "^__proto__$": { "type": "integer" } } } }
+#
+# 用返回的 Schema 校验新样本（POST /api/validate）：
+#   {"__proto__": 9}      -> { "valid": false }  缺少 b（仅含前件）
+#   {"__proto__": 9,"b":1}-> { "valid": true }
+# 反向规则 "implication|0:|1:b->9:__proto__" 则拒绝仅含 "b" 的新样本；
+# 作用域位于 __proto__ 值对象内部、嵌套对象或数组元素中的规则同样被 Ajv 执行。
 ```
 
 ## 目录结构

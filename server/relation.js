@@ -33,6 +33,15 @@
  *   - implication A -> B : dependentRequired: { A: [B, ...] }
  *   - exclusion A / B   : allOf: [ { not: { required: [A, B] } }, ... ]
  *
+ * "__proto__" fields stay enforced: the mined presence sets and the Ajv
+ * validator (ownProperties) judge presence by hasOwnProperty, so the rule
+ * holds whether "__proto__" is the antecedent or the consequent, at the root,
+ * inside nested objects or inside array element objects. Because Ajv skips a
+ * literal properties["__proto__"] node, the field is additionally carried by
+ * the inferred patternProperties "^__proto__$" alias; after cloning the
+ * enhancer re-points those aliases at the enhanced nodes (also covering scopes
+ * nested inside a "__proto__" value) before re-validating.
+ *
  * Every ORIGINAL sample is then re-validated against the enhanced schema with
  * Ajv; a single failure refuses the run (422) together with the failing sample
  * indexes — no enhanced schema is produced.
@@ -57,7 +66,7 @@
  */
 
 const Ajv2020 = require("ajv/dist/2020").default;
-const { escapePointer, setOwnKey } = require("./infer");
+const { escapePointer, setOwnKey, syncProtoAliasesDeep } = require("./infer");
 
 const MAX_SAMPLES = 200;
 const MIN_SUPPORT = 2;
@@ -656,9 +665,11 @@ function enhanceSchema({ schema, samples, ruleIds }) {
           : [];
         const deps = new Set(existing);
         deps.add(rule.b);
-        // A rule keyed "__proto__" must not hit the prototype setter; Ajv
-        // itself skips that dependentRequired name, so the rule simply stays
-        // descriptive for that edge.
+        // A rule keyed "__proto__" must be stored as an own data property, not
+        // hit the prototype setter. Ajv 2020-12 enumerates dependentRequired
+        // with for-in, so — together with the validator's ownProperties
+        // option — the own "__proto__" antecedent and a "__proto__"
+        // consequent are both checked by hasOwnProperty presence.
         setOwnKey(node.dependentRequired, rule.a, [...deps].sort());
       } else {
         if (!Array.isArray(node.allOf)) node.allOf = [];
@@ -666,6 +677,15 @@ function enhanceSchema({ schema, samples, ruleIds }) {
       }
     }
   }
+
+  // Inference keeps a literal properties["__proto__"] node and its
+  // patternProperties "^__proto__$" companion as ONE reference, because Ajv
+  // skips the literal properties entry and enforces that field only via the
+  // companion. The JSON clone above severed the alias, so rules landed on a
+  // node Ajv never compiles — including rules whose scope sits INSIDE a
+  // "__proto__" object value (root, nested or array elements). Re-point every
+  // companion at the enhanced node before compilation.
+  syncProtoAliasesDeep(enhanced);
 
   let validate;
   try {
